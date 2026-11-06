@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudTask - scalable 3-tier web application on AWS.
+  VPC + ALB + Auto Scaling Group (EC2) + RDS MySQL + S3 + IAM + CloudWatch.
+
+Parameters:
+  RepoUrl:
+    Type: String
+    Description: Public GitHub HTTPS URL of this project (e.g. https://github.com/<user>/cloudtask.git)
+  DBUsername:
+    Type: String
+    Default: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    AllowedPattern: "[a-zA-Z0-9]*"
+    ConstraintDescription: Letters and digits only, at least 8 characters.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------------- Networking ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: cloudtask-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: cloudtask-public-a }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: cloudtask-public-b }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: cloudtask-private-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: cloudtask-private-b }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRTAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicRTAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # ---------------- Security groups ----------------
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet to the load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow app traffic only from the load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSG }
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL only from app instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSG }
+
+  # ---------------- Storage ----------------
+  AttachmentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  # ---------------- Database ----------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Db:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      DBName: cloudtask
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSG]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+
+  # ---------------- IAM ----------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: AttachmentsBucketAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "${AttachmentsBucket.Arn}/*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------- Load balancer ----------------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSG]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 8000
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  # ---------------- Compute / Auto Scaling ----------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [!Ref AppSG]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            dnf install -y git python3-pip
+            git clone ${RepoUrl} /opt/cloudtask
+            python3 -m venv /opt/venv
+            /opt/venv/bin/pip install -r /opt/cloudtask/app/requirements.txt
+            cat > /etc/cloudtask.env <<EOF
+            DB_HOST=${Db.Endpoint.Address}
+            DB_USER=${DBUsername}
+            DB_PASSWORD=${DBPassword}
+            DB_NAME=cloudtask
+            S3_BUCKET=${AttachmentsBucket}
+            AWS_REGION=${AWS::Region}
+            EOF
+            cat > /etc/systemd/system/cloudtask.service <<EOF
+            [Unit]
+            Description=CloudTask Flask app
+            After=network.target
+            [Service]
+            WorkingDirectory=/opt/cloudtask/app
+            EnvironmentFile=/etc/cloudtask.env
+            ExecStart=/opt/venv/bin/gunicorn -w 2 -b 0.0.0.0:8000 app:app
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now cloudtask
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Db
+    Properties:
+      MinSize: "2"
+      MaxSize: "4"
+      DesiredCapacity: "2"
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: cloudtask-instance, PropagateAtLaunch: true }
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  # ---------------- Monitoring ----------------
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: At least one unhealthy target behind the load balancer
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: CloudTask
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"ASG average CPU (%)","region":"${AWS::Region}","stat":"Average","period":60,"metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${AutoScalingGroup}"]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"ALB request count","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Alb.LoadBalancerFullName}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Instances in service","region":"${AWS::Region}","stat":"Average","period":60,"metrics":[["AWS/AutoScaling","GroupInServiceInstances","AutoScalingGroupName","${AutoScalingGroup}"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"RDS CPU (%)","region":"${AWS::Region}","stat":"Average","period":60,"metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Db}"]]}}
+        ]}
+
+Outputs:
+  AppURL:
+    Description: Open this URL in a browser
+    Value: !Sub "http://${Alb.DNSName}"
+  BucketName:
+    Value: !Ref AttachmentsBucket
+  DatabaseEndpoint:
+    Value: !GetAtt Db.Endpoint.Address

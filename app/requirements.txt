@@ -1,0 +1,5 @@
+Flask==3.0.3
+gunicorn==22.0.0
+PyMySQL==1.1.1
+boto3==1.34.131
+cryptography==42.0.8

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloudTask</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { margin-bottom: .2rem; }
+    .badge { display: inline-block; background: #e0f2fe; color: #075985; border-radius: 6px; padding: 2px 8px; font-size: .85rem; }
+    form.add { display: flex; gap: .5rem; flex-wrap: wrap; margin: 1.2rem 0; }
+    form.add input[type=text] { flex: 1; min-width: 200px; padding: .5rem; }
+    button { padding: .45rem .8rem; cursor: pointer; }
+    ul { list-style: none; padding: 0; }
+    li { display: flex; align-items: center; gap: .6rem; padding: .6rem 0; border-bottom: 1px solid #e5e7eb; }
+    li.done .title { text-decoration: line-through; color: #9ca3af; }
+    .title { flex: 1; }
+    form.inline { display: inline; }
+  </style>
+</head>
+<body>
+  <h1>CloudTask</h1>
+  <p>Served by instance: <span class="badge">{{ instance }}</span> (refresh to see the load balancer switch instances)</p>
+
+  <form class="add" action="/add" method="post" enctype="multipart/form-data">
+    <input type="text" name="title" placeholder="New task..." required>
+    <input type="file" name="file">
+    <button type="submit">Add</button>
+  </form>
+
+  <ul>
+    {% for t in tasks %}
+    <li class="{{ 'done' if t.done else '' }}">
+      <form class="inline" action="/toggle/{{ t.id }}" method="post"><button>{{ '↩' if t.done else '✓' }}</button></form>
+      <span class="title">{{ t.title }}</span>
+      {% if t.url %}<a href="{{ t.url }}" target="_blank">attachment</a>{% endif %}
+      <form class="inline" action="/delete/{{ t.id }}" method="post"><button>✕</button></form>
+    </li>
+    {% else %}
+    <li>No tasks yet.</li>
+    {% endfor %}
+  </ul>
+</body>
+</html>
